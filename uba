@@ -1,0 +1,27 @@
+name: F1 News -> Discord
+on:
+  schedule:
+    - cron: '*/15 * * * *'  # ogni 15 minuti (modifica se vuoi frequenza diversa)
+  workflow_dispatch:
+
+jobs:
+  post-f1-news:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.10"
+
+      - name: Install dependencies
+        run: pip install --upgrade pip && pip install requests feedparser python-dateutil
+
+      - name: Run F1 news poster
+        env:
+          WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}        # Imposta questo secret nel repo (Settings → Secrets → Actions)
+          FEED_URL: "https://www.formula1.com/en/latest/article.rss"
+          # FILTER_KEYWORDS: "Ferrari,Leclerc"          # opzionale: attiva se vuoi filtrare per parole
+        run: python post_f1_news.py
