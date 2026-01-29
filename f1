@@ -1,0 +1,148 @@
+#!/usr/bin/env python3
+"""
+post_f1_news.py
+Legge un feed RSS (o più feed) di Formula 1, filtra (opzionale) e invia nuovi articoli
+a un webhook Discord. Tiene traccia degli articoli già inviati in seen.json.
+
+Requisiti:
+  pip install requests feedparser python-dateutil
+
+Configurazione via variabili d'ambiente:
+  WEBHOOK_URL         (obbligatoria) URL del webhook Discord (meglio mettere come secret in Actions)
+  FEED_URL            (opzionale) URL del feed RSS (default formula1.com)
+  SEEN_FILE           (opzionale) percorso file per memorizzare gli id inviati (default seen.json)
+  FILTER_KEYWORDS     (opzionale) parole chiave separate da virgola (es: Ferrari,Leclerc)
+  MAX_DESCRIPTION     (opzionale) max chars descrizione embed (default 1500)
+"""
+from __future__ import annotations
+import os
+import json
+import time
+import requests
+import feedparser
+from datetime import datetime
+from dateutil import parser as dtparser
+from typing import Optional, Set, List
+
+WEBHOOK_URL = os.environ.get("WEBHOOK_URL")  # REQUIRED
+FEED_URL = os.environ.get("FEED_URL") or "https://www.formula1.com/en/latest/article.rss"
+SEEN_FILE = os.environ.get("SEEN_FILE") or "seen.json"
+FILTER_KEYWORDS = [k.strip().lower() for k in (os.environ.get("FILTER_KEYWORDS") or "").split(",") if k.strip()]
+MAX_DESCRIPTION = int(os.environ.get("MAX_DESCRIPTION") or 1500)
+REQUEST_TIMEOUT = 10
+
+def load_seen() -> Set[str]:
+    if not os.path.exists(SEEN_FILE):
+        return set()
+    try:
+        with open(SEEN_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return set(data)
+    except Exception:
+        return set()
+
+def save_seen(seen: Set[str]) -> None:
+    with open(SEEN_FILE, "w", encoding="utf-8") as f:
+        json.dump(sorted(list(seen)), f, ensure_ascii=False, indent=2)
+
+def simple_text_from_html(s: str) -> str:
+    # Rimozione molto semplice di tag html (non usa parser completo per semplicità)
+    import re
+    text = re.sub(r"<[^>]+>", "", s or "")
+    text = text.replace("\n", " ").strip()
+    text = " ".join(text.split())
+    return text
+
+def entry_has_keyword(entry: dict, keywords: List[str]) -> bool:
+    if not keywords:
+        return True
+    hay = " ".join([
+        entry.get("title", ""),
+        entry.get("summary", ""),
+        entry.get("description", ""),
+    ]).lower()
+    return any(k in hay for k in keywords)
+
+def extract_image(entry: dict) -> Optional[str]:
+    # feedparser may expose media_content or media_thumbnail
+    media = entry.get("media_content") or entry.get("media_thumbnail")
+    if isinstance(media, list) and media:
+        url = media[0].get("url")
+        if url:
+            return url
+    if isinstance(media, dict):
+        return media.get("url")
+    # enclosure
+    links = entry.get("links") or []
+    for l in links:
+        if l.get("rel") in ("enclosure", "thumbnail") and l.get("type", "").startswith("image"):
+            return l.get("href")
+    return None
+
+def build_embed(entry: dict) -> dict:
+    title = entry.get("title", "No title")
+    link = entry.get("link", "")
+    published = entry.get("published") or entry.get("updated") or ""
+    summary = entry.get("summary") or entry.get("description") or ""
+    summary = simple_text_from_html(summary)
+    if len(summary) > MAX_DESCRIPTION:
+        summary = summary[:MAX_DESCRIPTION].rsplit(" ", 1)[0] + "…"
+    timestamp = None
+    try:
+        if published:
+            timestamp = dtparser.parse(published).isoformat()
+    except Exception:
+        timestamp = datetime.utcnow().isoformat()
+    embed = {
+        "title": title,
+        "url": link,
+        "description": summary or None,
+        "timestamp": timestamp or datetime.utcnow().isoformat(),
+        "color": 16711680,
+        "footer": {"text": f"Fonte: {FEED_URL}"},
+    }
+    image = extract_image(entry)
+    if image:
+        embed["image"] = {"url": image}
+    return embed
+
+def send_embed_to_discord(embed: dict) -> requests.Response:
+    payload = {"embeds": [embed]}
+    resp = requests.post(WEBHOOK_URL, json=payload, timeout=REQUEST_TIMEOUT)
+    resp.raise_for_status()
+    return resp
+
+def main() -> None:
+    if not WEBHOOK_URL:
+        print("ERRORE: WEBHOOK_URL non impostato. Imposta la variabile d'ambiente WEBHOOK_URL.")
+        return
+
+    seen = load_seen()
+    feed = feedparser.parse(FEED_URL)
+    if feed.bozo:
+        print("Attenzione: parsing feed ha riscontrato problemi:", getattr(feed, "bozo_exception", feed.bozo))
+    new_count = 0
+    for entry in feed.entries:
+        entry_id = entry.get("id") or entry.get("guid") or entry.get("link")
+        if not entry_id:
+            # genera fallback id basato su link+title
+            entry_id = (entry.get("link") or "") + "|" + (entry.get("title") or "")
+        if entry_id in seen:
+            continue
+        if not entry_has_keyword(entry, FILTER_KEYWORDS):
+            continue
+        embed = build_embed(entry)
+        try:
+            print(f"[{datetime.utcnow().isoformat()}] Invio: {entry.get('title')}")
+            send_embed_to_discord(embed)
+            time.sleep(1)  # piccolo delay per evitare rate-limit
+            seen.add(entry_id)
+            new_count += 1
+        except Exception as e:
+            print("Errore inviando webhook:", e)
+    if new_count:
+        save_seen(seen)
+    print(f"Fine esecuzione. Nuovi articoli inviati: {new_count}")
+
+if __name__ == "__main__":
+    main()
